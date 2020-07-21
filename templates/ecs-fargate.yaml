@@ -1,0 +1,302 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation template for deploying an ECS environment for handling
+  batch workloads. The CloudFormation template creates an input and an output
+  S3 bucket. Objects uploaded to the input S3 bucket creates an event that is
+  put in a SQS queue. The ECS task contains a Docker container that pulls
+  messages from the queue, reads the content and downloads the corresponding
+  object from the S3 bucket. The Docker container then transforms the object
+  and uploads it to the output S3 bucket.
+
+
+Parameters:
+
+  # --------------------------------------------------
+  # Parameters: ECS
+  # --------------------------------------------------
+
+  pDockerImage:
+    Type: String
+    Description: >
+      Docker repository and image file to deploy as part of the ECS task.
+      In the form repository/image
+
+  pSubnet1ID:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet 1 ID required for auto-scaling group
+
+  pSubnet2ID:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet 2 ID required for auto-scaling group
+
+Resources:
+
+  # --------------------------------------------------
+  # Resources: SQS
+  # --------------------------------------------------
+
+  rSQSBatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-SQSBatchQueue"
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - rSQSDeadLetterQueue
+            - Arn
+        maxReceiveCount: '5'
+
+  rSQSBatchQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: MySQSBatchQueuePolicy
+        Statement:
+          - Sid: Allow-send-message-from-S3
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: SQS:SendMessage
+            Resource:
+              Fn::GetAtt:
+                - rSQSBatchQueue
+                - Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Sub "input-${AWS::StackName}-${AWS::Region}"
+      Queues:
+        - Ref: rSQSBatchQueue
+
+  rSQSDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-SQSDeadLetterQueue"
+
+  # --------------------------------------------------
+  # Resources: S3
+  # --------------------------------------------------
+
+  rS3InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "input-${AWS::StackName}-${AWS::Region}"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:Put'
+            Queue: !GetAtt rSQSBatchQueue.Arn
+
+  rS3OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "output-${AWS::StackName}-${AWS::Region}"
+
+  # --------------------------------------------------
+  # Resources: ECS
+  # --------------------------------------------------
+
+  rECSCluster:
+    Type: AWS::ECS::Cluster
+
+  rTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # Makes sure the log group is created before it is used.
+    DependsOn: rLogGroup
+    Properties:
+      # awsvpc is required for Fargate
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: 0.5GB
+      ExecutionRoleArn: !GetAtt rExecutionRole.Arn
+      TaskRoleArn: !Ref rECSTaskRole
+      ContainerDefinitions:
+        -
+          Name: ECSFargateContainer
+          Image: !Ref pDockerImage
+          # Send logs to CloudWatch Logs
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref rLogGroup
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: s3OutputBucket
+              Value:
+                Ref: rS3OutputBucket
+            - Name: s3InputBucket
+              Value:
+                Ref: rS3InputBucket
+            - Name: AWSRegion
+              Value:
+                Ref: AWS::Region
+            - Name: SQSBatchQueue
+              Value: !Sub "${AWS::StackName}-SQSBatchQueue"
+
+  # A role needed by ECS
+  rExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  rECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: ecs-task
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sqs:ListQueues
+                  - sqs:GetQueueUrl
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:ChangeMessageVisibility
+                Resource:
+                  Fn::GetAtt:
+                    - rSQSBatchQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - Ref: rS3OutputBucket
+                      - "/*"
+
+
+  # A role needed for auto scaling
+  rAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  rECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref rECSCluster
+      TaskDefinition: !Ref rTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref pSubnet1ID
+            - !Ref pSubnet2ID
+
+  rAutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ECSAutoScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref rAutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        # Keep things at or lower than 50% CPU utilization, for example
+        TargetValue: 10
+
+  rAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 2
+      MaxCapacity: 5
+      ResourceId: !Join ['', [service/, !Ref 'rECSCluster', /, !GetAtt rECSService.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt rAutoScalingRole.Arn
+
+  # --------------------------------------------------
+  # Resources: CloudWatch
+  # --------------------------------------------------
+
+  rLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${AWS::StackName}-log-group"
+
+Outputs:
+
+  # --------------------------------------------------
+  # Outputs: ECS
+  # --------------------------------------------------
+
+  oECSCluster:
+    Description: The name of the ECS cluster
+    Value:
+      Ref: rECSCluster
+
+  oECSTask:
+    Description: The name of the ECS Task Definition
+    Value:
+      Ref: rTaskDefinition
+
+  # --------------------------------------------------
+  # Outputs: SQS
+  # --------------------------------------------------
+
+  oSQSBatchQueue:
+    Description: The SQS queue that is used to hold messages containing the
+      name of the uploaded objects
+    Value:
+      Ref: rSQSBatchQueue
+
+  # --------------------------------------------------
+  # Outputs: S3
+  # --------------------------------------------------
+
+  oS3InputBucket:
+    Description: The S3 bucket where images can be uploaded to
+    Value:
+      Ref: rS3InputBucket
+
+  oS3OutputBucket:
+    Description: The S3 bucket holding the resized images and thumbnails
+    Value:
+      Ref: rS3OutputBucket

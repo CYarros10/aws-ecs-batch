@@ -1,0 +1,576 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation template for deploying an ECS environment for handling
+  batch workloads. The CloudFormation template creates an input and an output
+  S3 bucket. Objects uploaded to the input S3 bucket creates an event that is
+  put in a SQS queue. The ECS task contains a Docker container that pulls
+  messages from the queue, reads the content and downloads the corresponding
+  object from the S3 bucket. The Docker container then transforms the object
+  and uploads it to the output S3 bucket.
+
+
+Parameters:
+
+  # --------------------------------------------------
+  # Parameters: ECS
+  # --------------------------------------------------
+
+  pMaxSize:
+    Type: Number
+    Description: >
+      Maximum number of instances in the AutoScaling Group and ECS Cluster
+    Default: '2'
+
+  pMessageThreshold:
+    Type: Number
+    Description: >
+      threshold number of messages in the SQS before scale up/down
+    Default: '5'
+
+  pDockerImage:
+    Type: String
+    Description: >
+      Docker repository and image file to deploy as part of the ECS task.
+      In the form repository/image
+
+  pECSAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: AMI ID
+    Default: "/aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id"
+
+  pInstanceType:
+    Description: The EC2 instance type
+    Default: t2.micro
+    Type: String
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarge
+      - d2.xlarge
+      - d2.2xlarge
+      - d2.4xlarge
+      - d2.8xlarge
+      - cr1.8xlarge
+      - cc2.8xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  pSSHLocation:
+    Description: >
+      "The IP address range that can be used to SSH to the EC2 instances"
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+  pVPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the VPC that will contain this solution
+
+  pSubnet1ID:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet 1 ID required for auto-scaling group
+
+  pSubnet2ID:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet 2 ID required for auto-scaling group
+
+Resources:
+
+  # --------------------------------------------------
+  # Resources: SQS
+  # --------------------------------------------------
+
+  rSQSBatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-SQSBatchQueue"
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+            - rSQSDeadLetterQueue
+            - Arn
+        maxReceiveCount: '5'
+
+  rSQSBatchQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: MySQSBatchQueuePolicy
+        Statement:
+          - Sid: Allow-send-message-from-S3
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: SQS:SendMessage
+            Resource:
+              Fn::GetAtt:
+                - rSQSBatchQueue
+                - Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Sub "input-${AWS::StackName}-${AWS::Region}"
+      Queues:
+        - Ref: rSQSBatchQueue
+
+  rSQSDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: rSQSDeadLetterQueue
+
+  # --------------------------------------------------
+  # Resources: S3
+  # --------------------------------------------------
+
+  rS3InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "input-${AWS::StackName}-${AWS::Region}"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:Put'
+            Queue: !GetAtt rSQSBatchQueue.Arn
+
+  rS3OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "output-${AWS::StackName}-${AWS::Region}"
+
+
+  # --------------------------------------------------
+  # Resources: ECS
+  # --------------------------------------------------
+
+  rECSCluster:
+    Type: AWS::ECS::Cluster
+
+  rTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      TaskRoleArn:
+        Ref: rECSTaskRole
+      ContainerDefinitions:
+        - Name: worker
+          Cpu: 10
+          Essential: true
+          Image:
+            Ref: pDockerImage
+          Memory: 300
+          Environment:
+            - Name: s3OutputBucket
+              Value:
+                Ref: rS3OutputBucket
+            - Name: s3InputBucket
+              Value:
+                Ref: rS3InputBucket
+            - Name: AWSRegion
+              Value:
+                Ref: AWS::Region
+            - Name: SQSBatchQueue
+              Value: !Sub "${AWS::StackName}-SQSBatchQueue"
+
+  rECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Ref: pSubnet1ID
+      - Ref: pSubnet2ID
+      LaunchConfigurationName:
+        Ref: rContainerInstancesAutoScalingLaunchConfig
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  rContainerInstancesAutoScalingLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_add_instance_to_cluster:
+              command:
+                Fn::Join:
+                  - ''
+                  - - "#!/bin/bash\n"
+                    - echo ECS_CLUSTER=
+                    - Ref: rECSCluster
+                    - " >> /etc/ecs/ecs.config"
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content:
+                Fn::Join:
+                  - ''
+                  - - "[main]\n"
+                    - stack=
+                    - Ref: AWS::StackId
+                    - "\n"
+                    - region=
+                    - Ref: AWS::Region
+                    - "\n"
+              mode: '000400'
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content:
+                Fn::Join:
+                  - ''
+                  - - "[cfn-auto-reloader-hook]\n"
+                    - "triggers=post.update\n"
+                    - "path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init\n"
+                    - 'action=/opt/aws/bin/cfn-init -v '
+                    - "         --stack "
+                    - Ref: AWS::StackName
+                    - "         --resource rContainerInstancesAutoScalingLaunchConfig "
+                    - "         --region "
+                    - Ref: AWS::Region
+                    - "\n"
+                    - "runas=root\n"
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+    Properties:
+      ImageId:
+        Ref: pECSAMI
+      InstanceType:
+        Ref: pInstanceType
+      SecurityGroups:
+        - Ref: rInstanceSecurityGroup
+      IamInstanceProfile:
+        Ref: rEC2InstanceProfile
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ''
+            - - "#!/bin/bash -xe\n"
+              - "yum install -y aws-cfn-bootstrap\n"
+              - "/opt/aws/bin/cfn-init -v "
+              - "         --stack "
+              - Ref: AWS::StackName
+              - "         --resource rContainerInstancesAutoScalingLaunchConfig "
+              - "         --region "
+              - Ref: AWS::Region
+              - "\n"
+              - "/opt/aws/bin/cfn-signal -e $? "
+              - "         --stack "
+              - Ref: AWS::StackName
+              - "         --resource rECSAutoScalingGroup "
+              - "         --region "
+              - Ref: AWS::Region
+              - "\n"
+              - "yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm\n"
+
+  rInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      VpcId: !Ref pVPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp:
+            Ref: pSSHLocation
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  rECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:Describe*
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:DeregisterTargets
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                  - elasticloadbalancing:RegisterTargets
+                  - ecr:*
+                Resource: "*"
+
+  rAmazonEC2ContainerServiceAutoscaleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: ecsautoscaling
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                Resource: "*"
+
+  rEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      Policies:
+        - PolicyName: ecs-instance
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Poll
+                  - ecs:RegisterContainerInstance
+                  - ecs:StartTelemetrySession
+                  - ecs:Submit*
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+
+  rECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: ecs-task
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sqs:ListQueues
+                  - sqs:GetQueueUrl
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:ChangeMessageVisibility
+                Resource:
+                  Fn::GetAtt:
+                    - rSQSBatchQueue
+                    - Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - Ref: rS3OutputBucket
+                      - "/*"
+
+  rEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - Ref: rEC2Role
+
+  rECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref rECSCluster
+      LaunchType: EC2
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      TaskDefinition: !Ref rTaskDefinition
+      ServiceName: !Sub "${AWS::StackName}-ECS-Service"
+
+  rScaleUpPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ECSTaskPolicyUp
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref rServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        Cooldown: 60
+        MetricAggregationType: "Average"
+        AdjustmentType: "ChangeInCapacity"
+        StepAdjustments:
+          - MetricIntervalLowerBound: !Ref pMessageThreshold
+            ScalingAdjustment: 1
+
+  rScaleDownPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ECSTaskPolicyDown
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref rServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        Cooldown: 60
+        MetricAggregationType: "Average"
+        AdjustmentType: "ChangeInCapacity"
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+
+  rServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref pMaxSize
+      MinCapacity: 1
+      ResourceId: !Join ['', [service/, !Ref 'rECSCluster', /, !GetAtt rECSService.Name]]
+      RoleARN: !GetAtt rAmazonEC2ContainerServiceAutoscaleRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  # --------------------------------------------------
+  # Resources: CloudWatch
+  # --------------------------------------------------
+
+  rSQSCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale ECS Service based on SQS queue depth
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref rScaleUpPolicy
+      OKActions:
+        - !Ref rScaleDownPolicy
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub "${AWS::StackName}-SQSBatchQueue"
+      EvaluationPeriods: 1
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Sum
+      Threshold: !Ref pMessageThreshold
+      Unit: Count
+
+
+Outputs:
+
+  # --------------------------------------------------
+  # Outputs: ECS
+  # --------------------------------------------------
+
+  oECSCluster:
+    Description: The name of the ECS cluster
+    Value:
+      Ref: rECSCluster
+
+  oECSTask:
+    Description: The name of the ECS Task Definition
+    Value:
+      Ref: rTaskDefinition
+
+  # --------------------------------------------------
+  # Outputs: SQS
+  # --------------------------------------------------
+
+  oSQSBatchQueue:
+    Description: The SQS queue that is used to hold messages containing the
+      name of the uploaded objects
+    Value:
+      Ref: rSQSBatchQueue
+
+  # --------------------------------------------------
+  # Outputs: S3
+  # --------------------------------------------------
+
+  oS3InputBucket:
+    Description: The S3 bucket where images can be uploaded to
+    Value:
+      Ref: rS3InputBucket
+
+  oS3OutputBucket:
+    Description: The S3 bucket holding the resized images and thumbnails
+    Value:
+      Ref: rS3OutputBucket
